@@ -38,41 +38,62 @@ if uploaded_file:
                 amount = mp_row['ACTUAL_AMOUNT']
                 time1 = mp_row['INITATE_DATE']
 
+                # 1️⃣ Récupérer le dernier Cash In du client avant le paiement marchand
+                ci = daily[
+                    (daily['REASON_NAME'].str.contains("cash in", na=False)) &
+                    (daily['CREDIT_MSISDN'] == client) &   # le client reçoit l'argent
+                    (daily['INITATE_DATE'] < time1)
+                ].sort_values(by='INITATE_DATE', ascending=False).head(1)
+
+                if ci.empty:
+                    continue
+            
+                cashin_from = ci.iloc[0]['DEBIT_MSISDN']   # distributeur A
+                ci_time = ci.iloc[0]['INITATE_DATE']
+            
+                # 2️⃣ Chercher Cash Out du marchand après paiement
                 bco = daily[
                     (daily['REASON_NAME'].str.contains("cash out", na=False)) &
                     (daily['DEBIT_MSISDN'] == merchant) &
                     (daily['ACTUAL_AMOUNT'] == amount) &
                     (daily['INITATE_DATE'] > time1)
                 ]
-
+            
                 for _, bco_row in bco.iterrows():
                     bco_time = bco_row['INITATE_DATE']
-                    cashout_to = bco_row['CREDIT_MSISDN']
+                    cashout_to = bco_row['CREDIT_MSISDN']  # distributeur B
                     delay = (bco_time - time1).total_seconds() / 60
-
+            
                     risk_score = 0
                     flags = []
-
+            
                     if delay < 10:
                         risk_score += 40
                         flags.append("Cashout rapide (<10 min)")
-
+            
                     if amount >= 20000:
                         risk_score += 30
                         flags.append("Montant élevé (>=20,000)")
-
+            
                     if client == cashout_to:
                         risk_score += 30
                         flags.append("Client identique au receveur cashout")
-
+            
+                    # ⚡ Nouveau test : comparaison distributeurs
+                    if cashin_from == cashout_to:
+                        risk_score += 50
+                        flags.append("Même distributeur pour CashIn et CashOut (circuit fermé)")
+            
                     if risk_score == 0:
                         risk_score = 10
                         flags.append("Activité inhabituelle détectée")
-
+            
                     suspicious.append({
                         'date': day,
                         'merchant': merchant,
                         'client': client,
+                        'cashin_from': cashin_from,
+                        'ci_time': ci_time,
                         'mp_time': time1,
                         'bco_time': bco_time,
                         'delay_minutes': delay,
@@ -83,6 +104,8 @@ if uploaded_file:
                         'risk_score': risk_score,
                         'flags': "; ".join(flags),
                     })
+                        
+
 
     result_df = pd.DataFrame(suspicious)
 
