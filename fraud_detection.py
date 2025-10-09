@@ -32,7 +32,7 @@ if uploaded_file:
         # Détection des clients répétitifs
         mp_all = chunk[chunk['REASON_NAME'].str.contains("merchant payment", na=False)]
         repeat = (
-            mp_all.groupby(['DATE', 'DEBIT_MSISDN', 'CREDIT_MSISDN'])
+            mp_all.groupby(['DEBIT_MSISDN', 'CREDIT_MSISDN'])
             .size()
             .reset_index(name='nb_paiements')
         )
@@ -43,7 +43,7 @@ if uploaded_file:
         # Détection des clients répétitifs
         cashin_all = chunk[chunk['REASON_NAME'].str.contains("customer cash in", na=False)]
         repeat_1 = (
-            cashin_all.groupby(['DATE', 'DEBIT_MSISDN', 'CREDIT_MSISDN'])
+            cashin_all.groupby(['DEBIT_MSISDN', 'CREDIT_MSISDN'])
             .size()
             .reset_index(name='nb_cashin')
         )
