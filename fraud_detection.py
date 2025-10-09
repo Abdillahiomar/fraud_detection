@@ -16,6 +16,7 @@ if uploaded_file:
     CHUNKSIZE = 100_000
     suspicious = []
     repeat_clients = []
+    repeat_cashin = []
 
     # Première lecture pour la détection principale
     chunk_iter = pd.read_csv(BytesIO(file_bytes), chunksize=CHUNKSIZE)
@@ -38,6 +39,17 @@ if uploaded_file:
         repeat = repeat[repeat['nb_paiements'] > 2]
         if not repeat.empty:
             repeat_clients.append(repeat)
+        
+        # Détection des clients répétitifs
+        cashin_all = chunk[chunk['REASON_NAME'].str.contains("customer cash in", na=False)]
+        repeat_1 = (
+            cashin_all.groupby(['DATE', 'DEBIT_MSISDN', 'CREDIT_MSISDN'])
+            .size()
+            .reset_index(name='nb_cashin')
+        )
+        repeat_1 = repeat_1[repeat_1['nb_cashin'] >=2 ]
+        if not repeat.empty:
+            repeat_cashin.append(repeat_1)
 
         # 🔍 Analyse des scénarios circulaires
         for day in chunk['DATE'].dropna().unique():
@@ -106,7 +118,9 @@ if uploaded_file:
                         'client': client,
                         'merchant': merchant,
                         'mp_time': time1,
+                        'mp_reason': mp_row['REASON_NAME'],
                         'bco_time': bco_time,
+                        'bco_reason': bco_row['REASON_NAME'],
                         'amount': amount,
                         'cashout_to': cashout_to,
                         'delay_minutes': delay,
@@ -135,22 +149,47 @@ if uploaded_file:
             redeem_df_list.append(grouped_redeem)
 
     redeem_df = pd.concat(redeem_df_list, ignore_index=True) if redeem_df_list else pd.DataFrame()
+    
+    cashin_fragmente = []
+    for chunk in pd.read_csv(BytesIO(file_bytes), chunksize=CHUNKSIZE):
+        chunk['REASON_NAME'] = chunk['REASON_NAME'].astype(str).str.strip().str.lower()
+        chunk['DEBIT_MSISDN'] = chunk['DEBIT_MSISDN'].astype(str).str.strip()
+        chunk['CREDIT_MSISDN'] = chunk['CREDIT_MSISDN'].astype(str).str.strip()
+        
+        cashin = chunk[chunk['REASON_NAME'].str.contains("customer cashin", na=False)]
+        if not cashin.empty:
+            grouped_cashin = (
+                cashin.groupby('CREDIT_MSISDN')
+                .agg(
+                    volume=('ACTUAL_AMOUNT', 'count'),
+                    valeur=('ACTUAL_AMOUNT', 'sum')
+                )
+                .reset_index()
+                .rename(columns={'DEBIT_MSISDN': 'client'})
+            )
+            cashin_fragmente.append(grouped_cashin)
+    cahin_df = pd.concat(cashin_fragmente, ignore_index=True) if cashin_fragmente else pd.DataFrame()
+                                                         
 
     # 🧭 Affichage côte à côte
     if repeat_clients:
         repeat_df = pd.concat(repeat_clients, ignore_index=True)
-        col1, col2 = st.columns(2)
+        repeat_cashin_df = pd.concat(repeat_cashin, ignore_index=True)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.subheader("⚠️ Clients ayant effectué >2 paiements / marchand / jour")
+            st.subheader("⚠️ Paiement Marchant >2 paiements / marchand / jour")
             st.dataframe(repeat_df)
 
         with col2:
-            st.subheader("✨ Clients ayant converti des points de fidélité")
+            st.subheader("✨ Points de Fidélité Converti")
             if not redeem_df.empty:
                 st.dataframe(redeem_df)
             else:
                 st.info("Aucune conversion de points détectée.")
+        with col3:
+            st.subheader("✨ Transactions de CASH IN")
+            st.dataframe(repeat_cashin_df)
 
     # 📊 Affichage des résultats principaux
     result_df = pd.DataFrame(suspicious)
