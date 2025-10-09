@@ -178,7 +178,7 @@ if uploaded_file:
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.subheader("⚠️ Paiement Marchant >2 paiements / marchand / jour")
+            st.subheader("⚠️ Paiement Marchant >2")
             st.dataframe(repeat_df)
 
         with col2:
