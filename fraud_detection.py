@@ -50,29 +50,12 @@ if uploaded_file:
         repeat_1 = repeat_1[repeat_1['nb_cashin'] >=2 ]
         
         
-        # Détection des clients répétitifs de Cash In de DSD
-        DSD_CASHIN = chunk[chunk['REASON_NAME'].str.contains("Customer Cash In at Dependent Sub Distributor", na=False)]
-        repeat_dsd_cash_in = (
-            DSD_CASHIN.groupby(['DEBIT_MSISDN', 'CREDIT_MSISDN'])
-            .size()
-            .reset_index(name='nb_cashin')
-        )
-        repeat_dsd_cash_in = repeat_dsd_cash_in[repeat_dsd_cash_in['nb_cashin'] >=2 ]
         
-        
-        # Détection des clients répétitifs de Cash In de DSD
-        Reg_CASHIN = chunk[chunk['REASON_NAME'].str.contains("Customer Cash In at Dependent Sub Distributor for Region", na=False)]
-        repeat_reg_cash_in = (
-            Reg_CASHIN.groupby(['DEBIT_MSISDN', 'CREDIT_MSISDN'])
-            .size()
-            .reset_index(name='nb_cashin')
-        )
-        repeat_reg_cash_in = repeat_reg_cash_in[repeat_reg_cash_in['nb_cashin'] >=2 ]
         
         if not repeat.empty:
             repeat_cashin.append(repeat_1)
-            repeat_cashin.append(repeat_dsd_cash_in)
-            repeat_cashin.append(repeat_reg_cash_in)
+            #repeat_cashin.append(repeat_dsd_cash_in)
+            #repeat_cashin.append(repeat_reg_cash_in)
 
         # 🔍 Analyse des scénarios circulaires
         for day in chunk['DATE'].dropna().unique():
