@@ -18,6 +18,7 @@ if uploaded_file:
     repeat_clients = []
     repeat_w2b = []
     repeat_cashin = []
+    cashin_then_w2b = []
 
     # Première lecture pour la détection principale
     chunk_iter = pd.read_csv(BytesIO(file_bytes), chunksize=CHUNKSIZE)
@@ -244,3 +245,44 @@ if uploaded_file:
             
     else:
         st.warning("Aucun scénario circulaire suspect détecté.")
+        
+    # 🔍 Détection Cash In → W2B (client)
+    chunk['INITATE_DATE'] = pd.to_datetime(chunk['INITATE_DATE'], errors='coerce')
+    chunk['DATE'] = chunk['INITATE_DATE'].dt.date
+    
+    cashin_tx = chunk[chunk['REASON_NAME'].str.contains("customer cash in", na=False)]
+    w2b_tx = chunk[chunk['REASON_NAME'].str.contains("w2b", na=False)]
+    
+    for day in chunk['DATE'].dropna().unique():
+        daily_cashin = cashin_tx[cashin_tx['DATE'] == day]
+        daily_w2b = w2b_tx[w2b_tx['DATE'] == day]
+    
+        for _, ci in daily_cashin.iterrows():
+            client = ci['CREDIT_MSISDN']
+            ci_time = ci['INITATE_DATE']
+    
+            w2b_after = daily_w2b[
+                (daily_w2b['DEBIT_MSISDN'] == client) &
+                (daily_w2b['INITATE_DATE'] > ci_time)
+            ]
+    
+            for _, w2b in w2b_after.iterrows():
+                delay = (w2b['INITATE_DATE'] - ci_time).total_seconds() / 60
+    
+                cashin_then_w2b.append({
+                    'date': day,
+                    'Distributeur' : ci['DEBIT_MSISDN'],
+                    'client': client,
+                    'cashin_amount': ci['ACTUAL_AMOUNT'],
+                    'cashin_time': ci_time,
+                    'w2b_amount': w2b['ACTUAL_AMOUNT'],
+                    'w2b_time': w2b['INITATE_DATE'],
+                    'delay_minutes': delay,
+                    'scenario': 'Cash In suivi de W2B'
+                })
+
+
+        if cashin_then_w2b:
+            st.subheader("🚨 Cash In suivi de W2B")
+            st.dataframe(pd.DataFrame(cashin_then_w2b))
+
