@@ -3,8 +3,8 @@ import pandas as pd
 from io import BytesIO
 import numpy as np
 
-st.set_page_config(page_title="Détection Scénario RDS->MCH->SD ", layout="wide")
-st.title("🕵️ Détection Améliorée de Scénarios RDS->MCH->SD")
+st.set_page_config(page_title="Détection des Scénarios de fraude ", layout="wide")
+st.title("🕵️ Détection des Scénarios de fraude")
 
 uploaded_file = st.file_uploader("📤 Charger le fichier CSV des transactions", type=["csv"])
 
@@ -16,6 +16,7 @@ if uploaded_file:
     CHUNKSIZE = 100_000
     suspicious = []
     repeat_clients = []
+    repeat_w2b = []
     repeat_cashin = []
 
     # Première lecture pour la détection principale
@@ -37,6 +38,8 @@ if uploaded_file:
             .reset_index(name='nb_paiements')
         )
         repeat = repeat[repeat['nb_paiements'] > 2]
+        
+        
         if not repeat.empty:
             repeat_clients.append(repeat)
         
@@ -49,18 +52,27 @@ if uploaded_file:
         )
         repeat_1 = repeat_1[repeat_1['nb_cashin'] >=2 ]
         
+        # Détection des clients répétitifs de W2B
+        all_w2b = chunk[chunk['REASON_NAME'].str.contains("w2b", na=False)] 
+        repeate_w2b = (
+            all_w2b.groupby([ 'DEBIT_MSISDN','CREDIT_MSISDN'])
+            .size()
+            .reset_index(name='nb_W2B')
+        )
+        repeate_w2b = repeate_w2b[repeate_w2b['nb_W2B'] >=2 ]
         
         
         
         if not repeat.empty:
             repeat_cashin.append(repeat_1)
-            #repeat_cashin.append(repeat_dsd_cash_in)
+            repeat_w2b.append(repeate_w2b)
             #repeat_cashin.append(repeat_reg_cash_in)
 
         # 🔍 Analyse des scénarios circulaires
         for day in chunk['DATE'].dropna().unique():
             daily = chunk[chunk['DATE'] == day]
             mp = daily[daily['REASON_NAME'].str.contains("merchant payment", na=False)]
+            
 
             for _, mp_row in mp.iterrows():
                 merchant = mp_row['CREDIT_MSISDN']
@@ -181,25 +193,41 @@ if uploaded_file:
     if repeat_clients:
         repeat_df = pd.concat(repeat_clients, ignore_index=True)
         repeat_cashin_df = pd.concat(repeat_cashin, ignore_index=True)
-        col1, col2, col3 = st.columns(3)
+        repeat_w2b_df = pd.concat(repeat_w2b, ignore_index=True)
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
             st.subheader("⚠️ Paiement Marchant >2")
-            st.dataframe(repeat_df)
+            if not repeat_df.empty:
+                st.dataframe(repeat_df)
+            else:
+                st.info("Aucune paiement marchant.")
 
         with col2:
-            st.subheader("✨ Points de Fidélité Converti")
+            st.subheader("✨ Points de Fidélité")
             if not redeem_df.empty:
                 st.dataframe(redeem_df)
             else:
                 st.info("Aucune conversion de points détectée.")
         with col3:
-            st.subheader("✨ Transactions de CASH IN")
-            st.dataframe(repeat_cashin_df)
+            st.subheader("✨ CASH IN")
+            if not repeat_cashin_df.empty:
+                st.dataframe(repeat_cashin_df)
+            else:
+                st.info("Aucune transaction de Cash In.")
+        with col4:
+            st.subheader("✨ W2B")
+            if not repeate_w2b.empty:
+                st.dataframe(repeat_w2b_df)
+            else:
+                st.info("Aucune transaction de Cash In.")
+            
+        
 
     # 📊 Affichage des résultats principaux
     result_df = pd.DataFrame(suspicious)
     if not result_df.empty:
+        
         grouped_df = result_df.groupby(['date', 'merchant']).agg(
             nb_cas=('amount', 'count'),
             montant_total=('amount', 'sum'),
@@ -209,7 +237,10 @@ if uploaded_file:
         st.subheader("📋 Détails Cas Individuels")
         st.dataframe(result_df)
 
+       
         st.subheader("📊 Résumé Groupé")
         st.dataframe(grouped_df)
+        
+            
     else:
         st.warning("Aucun scénario circulaire suspect détecté.")
