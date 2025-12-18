@@ -19,6 +19,7 @@ if uploaded_file:
     repeat_w2b = []
     repeat_cashin = []
     cashin_then_w2b = []
+    b2w_then_w2b = []
 
     # Première lecture pour la détection principale
     chunk_iter = pd.read_csv(BytesIO(file_bytes), chunksize=CHUNKSIZE)
@@ -277,6 +278,7 @@ if uploaded_file:
                     'cashin_time': ci_time,
                     'w2b_amount': w2b['ACTUAL_AMOUNT'],
                     'w2b_time': w2b['INITATE_DATE'],
+                    'Banque': w2b['CREDIT_MSISDN'],
                     'delay_minutes': delay,
                     'scenario': 'Cash In suivi de W2B'
                 })
@@ -285,4 +287,100 @@ if uploaded_file:
         if cashin_then_w2b:
             st.subheader("🚨 Cash In suivi de W2B")
             st.dataframe(pd.DataFrame(cashin_then_w2b))
+    
+    
+    
+    
+    # 🔍 Détection B2W → Send Money → W2B (Client A → Client B)
+    b2w_send_w2b = []
+    
+    chunk['INITATE_DATE'] = pd.to_datetime(chunk['INITATE_DATE'], errors='coerce')
+    chunk['DATE'] = chunk['INITATE_DATE'].dt.date
+    
+    b2w_tx = chunk[chunk['REASON_NAME'].str.contains("b2w", na=False)]
+    send_tx = chunk[chunk['REASON_NAME'].str.contains("send money", na=False)]
+    w2b_tx = chunk[chunk['REASON_NAME'].str.contains("w2b", na=False)]
+    
+    for day in chunk['DATE'].dropna().unique():
+        daily_b2w = b2w_tx[b2w_tx['DATE'] == day]
+        daily_send = send_tx[send_tx['DATE'] == day]
+        daily_w2b = w2b_tx[w2b_tx['DATE'] == day]
+    
+        for _, b2w in daily_b2w.iterrows():
+            client_a = b2w['CREDIT_MSISDN']
+            b2w_time = b2w['INITATE_DATE']
+    
+            # Send Money de A → B après B2W
+            send_after = daily_send[
+                (daily_send['DEBIT_MSISDN'] == client_a) &
+                (daily_send['INITATE_DATE'] > b2w_time)
+            ]
+    
+            for _, sm in send_after.iterrows():
+                client_b = sm['CREDIT_MSISDN']
+                sm_time = sm['INITATE_DATE']
+    
+                # W2B de B après réception
+                w2b_after = daily_w2b[
+                    (daily_w2b['DEBIT_MSISDN'] == client_b) &
+                    (daily_w2b['INITATE_DATE'] > sm_time)
+                ]
+    
+                for _, w2b in w2b_after.iterrows():
+                    delay_1 = (sm_time - b2w_time).total_seconds() / 60
+                    delay_2 = (w2b['INITATE_DATE'] - sm_time).total_seconds() / 60
+    
+                    b2w_send_w2b.append({
+                        'date': day,
+                        'Source Bank': b2w['DEBIT_MSISDN'],
+                        'client_A': client_a,
+                        'b2w_amount': b2w['ACTUAL_AMOUNT'],
+                        'b2w_time': b2w_time,
+                        'client_B': client_b,
+                        'send_amount': sm['ACTUAL_AMOUNT'],
+                        'send_time': sm_time,
+                        'w2b_amount': w2b['ACTUAL_AMOUNT'],
+                        'w2b_time': w2b['INITATE_DATE'],
+                        'Destination Bank': w2b['CREDIT_MSISDN'],
+                        'delay_B2W_to_Send_min': delay_1,
+                        'delay_Send_to_W2B_min': delay_2,
+                        'scenario': 'B2W → Send Money → W2B'
+                    })
+    
+    # 📊 Affichage
+    if b2w_send_w2b:
+        st.subheader("🚨 B2W → Send Money → W2B")
+        st.dataframe(pd.DataFrame(b2w_send_w2b))
+    else:
+        st.info("Aucun scénario B2W → Send Money → W2B détecté.")
+
+    
+    # 📊 Analyse des répétitions B2W → Send Money → W2B
+    if b2w_send_w2b:
+        scenario_df = pd.DataFrame(b2w_send_w2b)
+    
+        repetition_df = (
+            scenario_df
+            .groupby(['client_A', 'client_B'])
+            .agg(
+                nb_occurrences=('scenario', 'count'),
+                montant_total_b2w = ('b2w_amount', 'sum'),
+                montant_total_send=('send_amount', 'sum'),
+                montant_total_w2b=('w2b_amount', 'sum'),
+                premiere_date=('date', 'min'),
+                derniere_date=('date', 'max')
+            )
+            .reset_index()
+        )
+    
+        # Filtrer uniquement les couples suspects
+        repetition_df = repetition_df[repetition_df['nb_occurrences'] >= 1]
+    
+        st.subheader("🚩 Couples Client A → Client B répétant le scénario")
+        if not repetition_df.empty:
+            st.dataframe(repetition_df)
+        else:
+            st.info("Aucun couple n’a répété ce scénario plus d’une fois.")
+
+
 
