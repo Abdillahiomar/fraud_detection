@@ -3,7 +3,7 @@ import pandas as pd
 from io import BytesIO
 import numpy as np
 
-st.set_page_config(page_title="Détection des Scénarios de fraude ", layout="wide")
+st.set_page_config(page_title="Détection des Scénarios des fraudes ", layout="wide")
 st.title("🕵️ Détection des Scénarios de fraude")
 
 uploaded_file = st.file_uploader("📤 Charger le fichier CSV des transactions", type=["csv"])
