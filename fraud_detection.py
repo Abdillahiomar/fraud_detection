@@ -309,7 +309,7 @@ if uploaded_file:
         # Filtrer uniquement les couples suspects
         repetition_df_cashin_then_w2b = repetition_df_cashin_then_w2b[repetition_df_cashin_then_w2b['nb_occurrences_1'] >= 1]
     
-        st.subheader("🚩 Couples SD  → RDS répétant le scénario")
+        st.subheader("🚩 Couples SD  → RDS répétant le scénario cashin -> w2b")
         if not repetition_df_cashin_then_w2b.empty:
             st.dataframe(repetition_df_cashin_then_w2b)
         else:
