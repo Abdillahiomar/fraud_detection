@@ -287,9 +287,33 @@ if uploaded_file:
         if cashin_then_w2b:
             st.subheader("🚨 Cash In suivi de W2B")
             st.dataframe(pd.DataFrame(cashin_then_w2b))
+        
     
+    # 📊 Analyse des répétitions Cash In suivi de W2B
+    if cashin_then_w2b:
+        scenario_df_cashin_w2b = pd.DataFrame(cashin_then_w2b)
     
+        repetition_df_cashin_then_w2b = (
+            scenario_df_cashin_w2b
+            .groupby(['Distributeur', 'client'])
+            .agg(
+                nb_occurrences_1=('scenario', 'count'),
+                montant_total_b2w_1 = ('cashin_amount', 'sum'),
+                montant_total_w2b_1=('w2b_amount', 'sum'),
+                premiere_date_1=('date', 'min'),
+                derniere_date_1=('date', 'max')
+            )
+            .reset_index()
+        )
     
+        # Filtrer uniquement les couples suspects
+        repetition_df_cashin_then_w2b = repetition_df_cashin_then_w2b[repetition_df_cashin_then_w2b['nb_occurrences_1'] >= 1]
+    
+        st.subheader("🚩 Couples SD  → RDS répétant le scénario")
+        if not repetition_df_cashin_then_w2b.empty:
+            st.dataframe(repetition_df_cashin_then_w2b)
+        else:
+            st.info("Aucun couple n’a répété ce scénario plus d’une fois.")
     
     # 🔍 Détection B2W → Send Money → W2B (Client A → Client B)
     b2w_send_w2b = []
