@@ -317,50 +317,7 @@ if uploaded_file:
         st.info("Aucun scénario Cash In → W2B détecté.")
 
 
-    # 🔍 Cash In → Send → Send → W2B
-    with st.spinner("Détection Cash In → Send → Send → W2B..."):
-        cashin_send_send_w2b = []
-        
-        if cashin_send_w2b:
-            for path in cashin_send_w2b:
-                day = path['date']
-                
-                send_day = send_all[send_all['DATE'] == day].copy()
-                w2b_day = w2b_all[w2b_all['DATE'] == day].copy()
-                
-                second_send = send_day[
-                    (send_day['DEBIT_MSISDN'] == path['client_B']) &
-                    (send_day['INITATE_DATE'] > path['send_time'])
-                ]
-                
-                for _, sm2 in second_send.iterrows():
-                    client_c = sm2['CREDIT_MSISDN']
-                    send2_time = sm2['INITATE_DATE']
-                    
-                    w2b_after = w2b_day[
-                        (w2b_day['DEBIT_MSISDN'] == client_c) &
-                        (w2b_day['INITATE_DATE'] > send2_time)
-                    ]
-                    
-                    for _, w2b in w2b_after.iterrows():
-                        cashin_send_send_w2b.append({
-                            'date': day,
-                            'distributor': path['distributor'],
-                            'client_A': path['client_A'],
-                            'client_B': path['client_B'],
-                            'client_C': client_c,
-                            'cashin_amount': path['cashin_amount'],
-                            'send1_amount': path['send_amount'],
-                            'send2_amount': sm2['ACTUAL_AMOUNT'],
-                            'w2b_amount': w2b['ACTUAL_AMOUNT'],
-                            'scenario': 'CashIn → Send → Send → W2B'
-                        })
-
-    if cashin_send_send_w2b:
-        st.subheader("🚨 Cashin → Send → Send → W2B")
-        st.dataframe(pd.DataFrame(cashin_send_send_w2b), use_container_width=True)
-    else:
-        st.info("Aucun scénario Cash In → Send → Send → W2B détecté.")
+   
     
     # 🔍 DÉTECTION DE CHAÎNES CASH IN → SEND (N fois) → W2B
     with st.spinner("Détection des chaînes Cash In → Send Money (N) → W2B..."):
