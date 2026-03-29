@@ -3,87 +3,25 @@ import pandas as pd
 from io import BytesIO
 import numpy as np
 from datetime import datetime
-import mysql.connector
-from mysql.connector import Error
-
-
-DB_CONFIG = {
-    "host":     "192.168.100.50",
-    "user":     "streamlit",
-    "password": "Password!1",
-    "database": "fraud_detections",
-    "connect_timeout": 10,
-}
-
-def get_connection():
-    """Crée une nouvelle connexion à chaque appel."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
-    except Error as e:
-        st.error(f"Erreur connexion DB : {e}")
-        return None
-
-
-@st.cache_data(show_spinner=False)
-def load_from_db(date_debut, date_fin):
-    conn = get_connection()
-    if conn is None:
-        return pd.DataFrame()
-
-    try:
-        query = """
-            SELECT
-                  ORDERID, TRANS_STATUS, INITATE_DATE,
-                  REASON_TYPE, REASON_NAME,
-                  DEBIT_MSISDN, CREDIT_MSISDN,
-                  ACTUAL_AMOUNT, FEE, COMMISSION, TAX, AVAILABLE_BALANCE
-            FROM transactions
-            WHERE INITATE_DATE BETWEEN %s AND %s
-        """
-        chunks = pd.read_sql(query, conn, params=(date_debut, date_fin), chunksize=100_000)
-        df = pd.concat(chunks, ignore_index=True)
-
-        df['INITATE_DATE']  = pd.to_datetime(df['INITATE_DATE'],  errors='coerce')
-        df['ACTUAL_AMOUNT'] = pd.to_numeric(df['ACTUAL_AMOUNT'],  errors='coerce').fillna(0)
-        return df
-
-    except Error as e:
-        st.error(f"Erreur lors de la requête : {e}")
-        return pd.DataFrame()
-
-    finally:
-        if conn.is_connected():
-            conn.close()   # ← toujours fermer après usage
-
 
 st.set_page_config(page_title="Détection des Scénarios de fraude", layout="wide")
 st.title("🕵️ Détection des Scénarios de fraude")
 
+uploaded_file = st.file_uploader("📤 Charger le fichier CSV des transactions", type=["csv"])
 
-st.caption("Importez votre fichier CSV extrait depuis la base de données pour analyser les transactions suspectes.")
-
-
-#uploaded_file = st.file_uploader("📤 Charger le fichier CSV des transactions", type=["csv"])
-
-with st.sidebar:
-    st.header("📂 Fichier CSV")
-    
-    st.header("📅 Période d'analyse")
-
-    date_debut = st.date_input("Date début")
-    date_fin   = st.date_input("Date fin")
-    
-    date_debut = str(date_debut) + " 00:00:00"
-    date_fin   = str(date_fin)   + " 23:59:59"
-
-    charger = st.button("Charger les données")
-
-if not charger:
+if uploaded_file:
     # ✅ Lecture unique du fichier avec optimisations
     with st.spinner("Chargement et prétraitement des données..."):
-        df = load_from_db(date_debut, date_fin)
-        
+        df = pd.read_csv(
+            uploaded_file,
+            dtype={
+                'DEBIT_MSISDN': 'str',
+                'CREDIT_MSISDN': 'str',
+                'REASON_NAME': 'str',
+                'ACTUAL_AMOUNT': 'float32'
+            },
+            parse_dates=['INITATE_DATE']
+        )
         
         # Prétraitement global une seule fois
         df['REASON_NAME'] = df['REASON_NAME'].str.strip().str.lower()
@@ -381,373 +319,261 @@ if not charger:
 
    
     
-    # ══════════════════════════════════════════════════════════════════
-    # DÉTECTION : Cycling de commission
-    # Schéma : Agent fait CASH IN → Send Money (N) → W2B
-    #          puis recommence avec le MÊME argent le MÊME jour
-    #          pour accumuler des commissions artificielles
-    #
-    # Critères d'alerte :
-    #   - Même agent, même jour
-    #   - Même montant (± tolérance)
-    #   - Nombre de cycles ≥ seuil paramétrable
-    # ══════════════════════════════════════════════════════════════════
-
-    with st.spinner("Détection des cycles de commission (Cash In → Send → W2B)..."):
-
-        # ── Paramètres utilisateur ─────────────────────────────────────
-        st.markdown("#### ⚙️ Paramètres de détection")
-        col_p1, col_p2, col_p3 = st.columns(3)
-        with col_p1:
-            min_cycles = st.number_input(
-                "Nombre minimum de cycles pour alerte",
-                min_value=2, max_value=20, value=2, step=1,
-                help="Un cycle = 1 Cash In + chaîne Send Money + 1 W2B, même montant, même agent"
-            )
-        with col_p2:
-            amount_tolerance = st.slider(
-                "Tolérance montant (%)",
-                min_value=0, max_value=10, value=1, step=1,
-                help="Écart autorisé entre les montants pour considérer que c'est le même argent"
-            ) / 100
-        with col_p3:
-            max_depth = st.number_input(
-                "Profondeur max Send Money",
-                min_value=1, max_value=20, value=10, step=1,
-                help="Nombre maximum de Send Money dans une chaîne"
-            )
-
-        st.divider()
-
-        # ── Fonction utilitaire ────────────────────────────────────────
-        def same_amount(a, b, tol=amount_tolerance):
-            if a == 0:
-                return False
-            return abs(a - b) / a <= tol
-
-        # ── Recherche d'une chaîne SEND → W2B pour un montant donné ───
-        def find_chain(start_client, start_time, target_amount,
-                       send_day, w2b_day, max_depth):
+    # 🔍 DÉTECTION DE CHAÎNES CASH IN → SEND (N fois) → W2B
+    with st.spinner("Détection des chaînes Cash In → Send Money (N) → W2B..."):
+        
+        def find_money_chains(ci_row, send_day, w2b_day, max_depth=10):
             """
-            Explore récursivement les Send Money du même montant
-            jusqu'à trouver un W2B.
-            Retourne la première chaîne complète trouvée, ou None.
+            Trouve toutes les chaînes de Send Money partant d'un Cash In jusqu'à un W2B
+            
+            Args:
+                ci_row: La transaction Cash In de départ
+                send_day: DataFrame des Send Money du jour
+                w2b_day: DataFrame des W2B du jour
+                max_depth: Profondeur maximale de recherche (nombre max de Send Money)
+            
+            Returns:
+                List of chains (chaque chain est une liste de transactions)
             """
-            def explore(client, t, path, depth):
+            chains = []
+            
+            def explore_chain(current_client, current_time, path, depth):
+                """Exploration récursive des chaînes"""
+                
+                # Limite de profondeur pour éviter les boucles infinies
                 if depth > max_depth:
-                    return None
-
-                # Y a-t-il un W2B depuis ce client après t ?
-                w2b_hits = w2b_day[
-                    (w2b_day['DEBIT_MSISDN'] == client) &
-                    (w2b_day['INITATE_DATE'] > t)
+                    return
+                
+                # Vérifier si ce client fait un W2B après current_time
+                w2b_matches = w2b_day[
+                    (w2b_day['DEBIT_MSISDN'] == current_client) &
+                    (w2b_day['INITATE_DATE'] > current_time)
                 ]
-                for _, w in w2b_hits.iterrows():
-                    return path + [{
-                        'type':   'W2B',
-                        'from':   w['DEBIT_MSISDN'],
-                        'to':     w['CREDIT_MSISDN'],
-                        'amount': w['ACTUAL_AMOUNT'],
-                        'time':   w['INITATE_DATE'],
+                
+                # Si on trouve un W2B, on a une chaîne complète
+                for _, w2b_row in w2b_matches.iterrows():
+                    complete_chain = path + [{
+                        'type': 'w2b',
+                        'from': w2b_row['DEBIT_MSISDN'],
+                        'to': w2b_row['CREDIT_MSISDN'],
+                        'amount': w2b_row['ACTUAL_AMOUNT'],
+                        'time': w2b_row['INITATE_DATE'],
+                        'bank': w2b_row['CREDIT_MSISDN']
                     }]
-
-                # Send Money avec le même montant
-                sends = send_day[
-                    (send_day['DEBIT_MSISDN'] == client) &
-                    (send_day['INITATE_DATE'] > t) &
-                    (send_day['ACTUAL_AMOUNT'].apply(
-                        lambda x: same_amount(x, target_amount)
-                    ))
+                    chains.append(complete_chain)
+                
+                # Chercher les Send Money suivants
+                next_sends = send_day[
+                    (send_day['DEBIT_MSISDN'] == current_client) &
+                    (send_day['INITATE_DATE'] > current_time)
                 ]
-                visited = {s['from'] for s in path} | {s['to'] for s in path}
-                for _, s in sends.iterrows():
-                    if s['CREDIT_MSISDN'] in visited:
+                
+                # Explorer chaque Send Money trouvé
+                for _, send_row in next_sends.iterrows():
+                    next_client = send_row['CREDIT_MSISDN']
+                    next_time = send_row['INITATE_DATE']
+                    
+                    # Éviter les cycles (client qui s'envoie à lui-même dans la chaîne)
+                    clients_in_path = [step['to'] for step in path if step['type'] == 'send']
+                    if next_client in clients_in_path:
                         continue
-                    result = explore(
-                        s['CREDIT_MSISDN'],
-                        s['INITATE_DATE'],
-                        path + [{
-                            'type':   'SEND',
-                            'from':   s['DEBIT_MSISDN'],
-                            'to':     s['CREDIT_MSISDN'],
-                            'amount': s['ACTUAL_AMOUNT'],
-                            'time':   s['INITATE_DATE'],
-                        }],
-                        depth + 1
-                    )
-                    if result:
-                        return result
-                return None
-
-            return explore(start_client, start_time, [], 1)
-
-        # ── Boucle principale : jour par jour ─────────────────────────
-        # Structure résultat : une ligne par AGENT × JOUR × MONTANT
-        # contenant tous les cycles détectés
-
-        agent_day_cycles = {}   # clé : (agent, day, amount_bucket)
-
+                    
+                    new_path = path + [{
+                        'type': 'send',
+                        'from': send_row['DEBIT_MSISDN'],
+                        'to': send_row['CREDIT_MSISDN'],
+                        'amount': send_row['ACTUAL_AMOUNT'],
+                        'time': send_row['INITATE_DATE']
+                    }]
+                    
+                    # Exploration récursive
+                    explore_chain(next_client, next_time, new_path, depth + 1)
+            
+            # Démarrer l'exploration depuis le client qui reçoit le Cash In
+            initial_client = ci_row['CREDIT_MSISDN']
+            initial_time = ci_row['INITATE_DATE']
+            
+            initial_path = [{
+                'type': 'cashin',
+                'from': ci_row['DEBIT_MSISDN'],
+                'to': ci_row['CREDIT_MSISDN'],
+                'amount': ci_row['ACTUAL_AMOUNT'],
+                'time': ci_row['INITATE_DATE'],
+                'distributor': ci_row['DEBIT_MSISDN']
+            }]
+            
+            explore_chain(initial_client, initial_time, initial_path, depth=1)
+            
+            return chains
+        
+        # Collecte de toutes les chaînes détectées
+        all_chains = []
+        
         for day in cashin_all['DATE'].unique():
-            ci_day   = cashin_all[cashin_all['DATE'] == day].copy()
+            ci_day = cashin_all[cashin_all['DATE'] == day].copy()
             send_day = send_all[send_all['DATE'] == day].copy()
-            w2b_day  = w2b_all[w2b_all['DATE'] == day].copy()
-
+            w2b_day = w2b_all[w2b_all['DATE'] == day].copy()
+            
             if ci_day.empty or send_day.empty or w2b_day.empty:
                 continue
-
-            for _, ci in ci_day.iterrows():
-                agent      = ci['DEBIT_MSISDN']
-                ci_amount  = ci['ACTUAL_AMOUNT']
-                ci_client  = ci['CREDIT_MSISDN']
-                ci_time    = ci['INITATE_DATE']
-
-                # Chercher la chaîne Send → W2B pour ce Cash In
-                chain = find_chain(
-                    ci_client, ci_time, ci_amount,
-                    send_day, w2b_day, max_depth
-                )
-                if chain is None:
-                    continue   # pas de W2B en bout de chaîne → pas un cycle
-
-                # Calculer métriques du cycle
-                nb_send   = sum(1 for s in chain if s['type'] == 'SEND')
-                w2b_time  = chain[-1]['time']
-                w2b_amt   = chain[-1]['amount']
-                delay_min = (w2b_time - ci_time).total_seconds() / 60
-
-                full_chain = ' → '.join(
-                    f"{s['type']}({s['amount']:,.0f})" for s in
-                    [{'type':'CASHIN','amount':ci_amount}] + chain
-                )
-                clients_path = ' → '.join(
-                    [ci_client] +
-                    [s['to'] for s in chain if s['type'] == 'SEND']
-                )
-
-                # Regrouper par (agent, jour, montant) pour compter les cycles
-                # On arrondit le montant à 100 FDJ pour tolérance naturelle
-                amount_bucket = round(ci_amount / 100) * 100
-                key = (agent, day, amount_bucket)
-
-                if key not in agent_day_cycles:
-                    agent_day_cycles[key] = {
-                        'agent':          agent,
-                        'date':           day,
-                        'montant_ref':    ci_amount,
-                        'cycles':         [],
-                    }
-
-                agent_day_cycles[key]['cycles'].append({
-                    'ci_time':      ci_time,
-                    'w2b_time':     w2b_time,
-                    'ci_amount':    ci_amount,
-                    'w2b_amount':   w2b_amt,
-                    'nb_send':      nb_send,
-                    'delay_min':    round(delay_min, 1),
-                    'clients_path': clients_path,
-                    'full_chain':   full_chain,
-                    'montant_flag': 'MÊME MONTANT' if same_amount(ci_amount, w2b_amt) else 'MONTANT DIFFÉRENT',
-                    'delta_fdj':    round(ci_amount - w2b_amt, 2),
-                })
-
-        # ── Construire le DataFrame des alertes ────────────────────────
-        rows = []
-        for key, data in agent_day_cycles.items():
-            nb_cycles = len(data['cycles'])
-            if nb_cycles < min_cycles:
-                continue   # sous le seuil → pas d'alerte
-
-            cycles      = data['cycles']
-            total_ci    = sum(c['ci_amount']  for c in cycles)
-            total_w2b   = sum(c['w2b_amount'] for c in cycles)
-            commission  = total_ci * 0.0256   # 2.56% uniquement sur Cash In
-
-            # Durée totale d'activité ce jour-là
-            first_ci    = min(c['ci_time']  for c in cycles)
-            last_w2b    = max(c['w2b_time'] for c in cycles)
-            span_min    = (last_w2b - first_ci).total_seconds() / 60
-
-            # Délai moyen par cycle
-            avg_delay   = sum(c['delay_min'] for c in cycles) / nb_cycles
-
-            # Nb Send Money moyen par cycle
-            avg_send    = sum(c['nb_send']   for c in cycles) / nb_cycles
-
-            # Flag montant : tous les cycles ont le même montant ?
-            flags_montant = set(c['montant_flag'] for c in cycles)
-            if flags_montant == {'MÊME MONTANT'}:
-                flag_global = '✅ MÊME MONTANT (tous cycles)'
-            elif flags_montant == {'MONTANT DIFFÉRENT'}:
-                flag_global = '⚠️ MONTANT DIFFÉRENT (tous cycles)'
-            else:
-                flag_global = '🔀 MIXTE'
-
-            # Score de risque
-            risk  = 0
-            flags = []
-
-            if nb_cycles >= 5:
-                risk += 100; flags.append(f"{nb_cycles} cycles détectés")
-            elif nb_cycles >= 3:
-                risk += 60;  flags.append(f"{nb_cycles} cycles détectés")
-            else:
-                risk += 30;  flags.append(f"{nb_cycles} cycles détectés")
-
-            if avg_send >= 3:
-                risk += 40; flags.append(f"Chaîne longue (moy. {avg_send:.1f} Send/cycle)")
-
-            if avg_delay < 30:
-                risk += 50; flags.append("Cycles très rapides (< 30 min en moyenne)")
-            elif avg_delay < 60:
-                risk += 30; flags.append("Cycles rapides (< 1h en moyenne)")
-
-            if total_ci >= 200_000:
-                risk += 40; flags.append(f"Volume élevé ({total_ci:,.0f} FDJ)")
-
-            if '✅ MÊME MONTANT' in flag_global:
-                risk += 30; flags.append("Montant identique à chaque cycle (argent recyclé)")
-
-            rows.append({
-                'date':              data['date'],
-                'agent':             data['agent'],
-                'nb_cycles':         nb_cycles,
-                'montant_par_cycle': data['montant_ref'],
-                'total_cashin_fdj':  round(total_ci, 2),
-                'total_w2b_fdj':     round(total_w2b, 2),
-                'commission_gagnee': round(commission, 2),
-                'commission_si_1':   round(data['montant_ref'] * 0.0256, 2),
-                'surplus_commission':round(commission - data['montant_ref'] * 0.0256, 2),
-                'flag_montant':      flag_global,
-                'avg_send_per_cycle':round(avg_send, 1),
-                'avg_delay_min':     round(avg_delay, 1),
-                'span_minutes':      round(span_min, 1),
-                'risk_score':        risk,
-                'flags':             '; '.join(flags),
-                '_cycles_detail':    cycles,   # pour le détail (non affiché dans tableau)
-            })
-
-        # ── Affichage ──────────────────────────────────────────────────
-        if not rows:
-            st.info(f"Aucun agent avec ≥ {min_cycles} cycles détectés aujourd'hui.")
-        else:
-            alerts_df = pd.DataFrame(rows).sort_values('risk_score', ascending=False)
-
-            st.subheader("🚨 Agents en cycling de commission")
-            st.caption(
-                f"Critères : même agent · même jour · même montant (±{int(amount_tolerance*100)}%) · "
-                f"≥ {min_cycles} cycles Cash In → Send Money → W2B"
-            )
-
-            # ── KPIs ──
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Agents alertés",       len(alerts_df))
-            c2.metric("Total cycles",          int(alerts_df['nb_cycles'].sum()))
-            c3.metric("Commission totale",     f"{alerts_df['commission_gagnee'].sum():,.0f} FDJ")
-            c4.metric("Surplus commission",    f"{alerts_df['surplus_commission'].sum():,.0f} FDJ",
-                      help="Commission perçue - commission légitime sur 1 seul Cash In")
-            c5.metric("Volume total Cash In",  f"{alerts_df['total_cashin_fdj'].sum():,.0f} FDJ")
-
-            # ── Tableau principal ──
+            
+            # Pour chaque Cash In, chercher les chaînes
+            for _, ci_row in ci_day.iterrows():
+                chains = find_money_chains(ci_row, send_day, w2b_day, max_depth=10)
+                
+                # Traiter chaque chaîne trouvée
+                for chain in chains:
+                    # Calculer les métriques de la chaîne
+                    nb_send = sum(1 for step in chain if step['type'] == 'send')
+                    
+                    # Extraire les clients impliqués
+                    clients = [step['to'] for step in chain if step['type'] in ['cashin', 'send']]
+                    
+                    # Calculer le délai total
+                    first_time = chain[0]['time']
+                    last_time = chain[-1]['time']
+                    total_delay = (last_time - first_time).total_seconds() / 60
+                    
+                    # Calculer les montants
+                    cashin_amount = chain[0]['amount']
+                    w2b_amount = chain[-1]['amount']
+                    send_amounts = [step['amount'] for step in chain if step['type'] == 'send']
+                    
+                    # Score de suspicion
+                    risk_score = 0
+                    flags = []
+                    
+                    # Plus il y a de Send Money, plus c'est suspect
+                    if nb_send >= 5:
+                        risk_score += 100
+                        flags.append(f"Chaîne très longue ({nb_send} Send Money)")
+                    elif nb_send >= 3:
+                        risk_score += 60
+                        flags.append(f"Chaîne longue ({nb_send} Send Money)")
+                    elif nb_send >= 2:
+                        risk_score += 30
+                        flags.append(f"Chaîne moyenne ({nb_send} Send Money)")
+                    
+                    # Délai court = plus suspect
+                    if total_delay < 30:
+                        risk_score += 50
+                        flags.append(f"Très rapide (<30 min)")
+                    elif total_delay < 60:
+                        risk_score += 30
+                        flags.append(f"Rapide (<1h)")
+                    
+                    # Montants élevés
+                    if cashin_amount >= 50000:
+                        risk_score += 40
+                        flags.append("Montant élevé")
+                    
+                    # Commission potentielle
+                    # D-Money: 2.56% sur Cash In, 0% sur Send Money
+                    cashin_commission = cashin_amount * 0.0256
+                    
+                    # Commission totale = seulement sur le Cash In
+                    total_commission = cashin_commission
+                    
+                    # Commission par intermédiaire (si la chaîne est longue, la commission est diluée)
+                    commission_per_intermediary = cashin_commission / (nb_send + 1) if nb_send > 0 else cashin_commission
+                    
+                    all_chains.append({
+                        'date': day,
+                        'distributor': chain[0]['from'],
+                        'nb_send_money': nb_send,
+                        'clients_chain': ' → '.join(clients),
+                        'cashin_amount': cashin_amount,
+                        'cashin_time': first_time,
+                        'w2b_amount': w2b_amount,
+                        'w2b_time': last_time,
+                        'w2b_bank': chain[-1]['bank'],
+                        'total_delay_minutes': round(total_delay, 2),
+                        'cashin_commission_djf': round(cashin_commission, 2),
+                        'commission_per_person': round(commission_per_intermediary, 2),
+                        'risk_score': risk_score,
+                        'flags': "; ".join(flags),
+                        'full_chain': ' → '.join([f"{step['type'].upper()}({step['amount']:.0f})" for step in chain])
+                    })
+        
+        # Affichage des résultats
+        if all_chains:
+            chains_df = pd.DataFrame(all_chains)
+            
+            # Trier par nombre de Send Money (les plus longs d'abord)
+            chains_df = chains_df.sort_values(['nb_send_money', 'risk_score'], ascending=[False, False])
+            
+            st.subheader("🚨 Chaînes Cash In → Send Money (N) → W2B")
+            
+            # Métriques clés
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Chaînes", len(chains_df))
+            with col2:
+                st.metric("Chaîne Max", chains_df['nb_send_money'].max(), "Send Money")
+            with col3:
+                total_commission = chains_df['cashin_commission_djf'].sum()
+                st.metric("Commission Cash In Total", f"{total_commission:.2f} DJF")
+            with col4:
+                avg_length = chains_df['nb_send_money'].mean()
+                st.metric("Longueur Moyenne", f"{avg_length:.1f}")
+            
+            # Tableau détaillé
             st.dataframe(
-                alerts_df.drop(columns=['_cycles_detail']),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    'nb_cycles': st.column_config.NumberColumn(
-                        '🔄 Nb cycles',
-                        help="Nombre de fois que l'agent a répété le schéma ce jour-là"
-                    ),
-                    'surplus_commission': st.column_config.NumberColumn(
-                        '💰 Surplus commission (FDJ)',
-                        help="Commission frauduleuse = commission totale - commission d'1 seul Cash In légitime",
-                        format="%,.0f"
-                    ),
-                    'flag_montant': st.column_config.TextColumn(
-                        '🏷️ Flag montant',
-                    ),
-                    'risk_score': st.column_config.ProgressColumn(
-                        'Score risque', min_value=0, max_value=270, format="%d"
-                    ),
-                    'commission_gagnee': st.column_config.NumberColumn(format="%,.0f"),
-                    'total_cashin_fdj':  st.column_config.NumberColumn(format="%,.0f"),
-                    'total_w2b_fdj':     st.column_config.NumberColumn(format="%,.0f"),
-                    'montant_par_cycle': st.column_config.NumberColumn(format="%,.0f"),
-                }
-            )
-
-            # ── Détail cycle par cycle ──
-            st.subheader("🔍 Détail par agent")
-            for _, row in alerts_df.iterrows():
-                with st.expander(
-                    f"🔄 {row['agent']}  |  {row['nb_cycles']} cycles  "
-                    f"|  {row['montant_par_cycle']:,.0f} FDJ/cycle  "
-                    f"|  Surplus : {row['surplus_commission']:,.0f} FDJ  "
-                    f"|  Score : {row['risk_score']}"
-                ):
-                    st.markdown(f"""
-                    | Indicateur | Valeur |
-                    |---|---|
-                    | Date | {row['date']} |
-                    | Montant par cycle | {row['montant_par_cycle']:,.0f} FDJ |
-                    | Nombre de cycles | {row['nb_cycles']} |
-                    | Commission totale perçue | {row['commission_gagnee']:,.0f} FDJ |
-                    | Commission légitime (1 cycle) | {row['commission_si_1']:,.0f} FDJ |
-                    | **Surplus frauduleux** | **{row['surplus_commission']:,.0f} FDJ** |
-                    | Send Money moyen / cycle | {row['avg_send_per_cycle']} |
-                    | Délai moyen / cycle | {row['avg_delay_min']} min |
-                    | Durée totale activité | {row['span_minutes']} min |
-                    | Flag montant | {row['flag_montant']} |
-                    | Flags | {row['flags']} |
-                    """)
-
-                    st.markdown("**Détail des cycles :**")
-                    for i, cycle in enumerate(row['_cycles_detail'], 1):
-                        flag_icon = "✅" if cycle['montant_flag'] == 'MÊME MONTANT' else "⚠️"
-                        st.markdown(
-                            f"**Cycle {i}** {flag_icon}  `{cycle['full_chain']}`  "
-                            f"— délai : {cycle['delay_min']} min  "
-                            f"— {cycle['nb_send']} Send Money  "
-                            f"— delta : {cycle['delta_fdj']:,.0f} FDJ"
-                        )
-
-            # ── Export Excel ──
-            from io import BytesIO
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                alerts_df.drop(columns=['_cycles_detail']).to_excel(
-                    writer, sheet_name='Alertes_cycling', index=False
-                )
-                # Feuille détail : une ligne par cycle
-                detail_rows = []
-                for _, row in alerts_df.iterrows():
-                    for i, c in enumerate(row['_cycles_detail'], 1):
-                        detail_rows.append({
-                            'agent':         row['agent'],
-                            'date':          row['date'],
-                            'cycle_num':     i,
-                            'ci_time':       c['ci_time'],
-                            'w2b_time':      c['w2b_time'],
-                            'ci_amount':     c['ci_amount'],
-                            'w2b_amount':    c['w2b_amount'],
-                            'nb_send':       c['nb_send'],
-                            'delay_min':     c['delay_min'],
-                            'montant_flag':  c['montant_flag'],
-                            'delta_fdj':     c['delta_fdj'],
-                            'clients_path':  c['clients_path'],
-                            'full_chain':    c['full_chain'],
-                        })
-                pd.DataFrame(detail_rows).to_excel(
-                    writer, sheet_name='Détail_cycles', index=False
-                )
-
-            st.download_button(
-                "⬇️ Exporter les alertes (Excel)",
-                data=buf.getvalue(),
-                file_name=f"cycling_commission_{pd.Timestamp.today().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                chains_df[[
+                    'date', 'distributor', 'nb_send_money', 'clients_chain',
+                    'cashin_amount', 'cashin_commission_djf', 'commission_per_person',
+                    'w2b_amount', 'total_delay_minutes', 'risk_score', 'flags'
+                ]],
                 use_container_width=True
             )
-    
+            
+            # Afficher quelques exemples de chaînes complètes
+            st.subheader("🔍 Détail des chaînes les plus suspectes")
+            top_chains = chains_df.nlargest(5, 'risk_score')
+            for idx, row in top_chains.iterrows():
+                with st.expander(f"⚠️ Chaîne {idx+1}: {row['nb_send_money']} Send Money - Score: {row['risk_score']}"):
+                    st.write(f"**Date:** {row['date']}")
+                    st.write(f"**Distributeur:** {row['distributor']}")
+                    st.write(f"**Flux complet:** {row['full_chain']}")
+                    st.write(f"**Clients:** {row['clients_chain']}")
+                    st.write(f"**Délai total:** {row['total_delay_minutes']} minutes")
+                    st.write(f"**Commission Cash In:** {row['cashin_commission_djf']:.2f} DJF (2.56%)")
+                    st.write(f"**Commission par personne:** {row['commission_per_person']:.2f} DJF")
+                    st.write(f"**Flags:** {row['flags']}")
+            
+            # Analyse des répétitions par distributeur
+            st.subheader("📊 Analyse par Distributeur")
+            distributor_analysis = (
+                chains_df.groupby('distributor')
+                .agg(
+                    nb_chaines=('nb_send_money', 'count'),
+                    longueur_moyenne=('nb_send_money', 'mean'),
+                    commission_cashin_totale=('cashin_commission_djf', 'sum'),
+                    montant_total_cashin=('cashin_amount', 'sum'),
+                    score_moyen=('risk_score', 'mean')
+                )
+                .reset_index()
+                .sort_values('commission_cashin_totale', ascending=False)
+            )
+            st.dataframe(distributor_analysis, use_container_width=True)
+            
+            # Analyse des clients récurrents
+            st.subheader("👥 Clients Récurrents dans les Chaînes")
+            all_clients_in_chains = []
+            for clients_str in chains_df['clients_chain']:
+                all_clients_in_chains.extend(clients_str.split(' → '))
+            
+            client_frequency = pd.Series(all_clients_in_chains).value_counts().reset_index()
+            client_frequency.columns = ['Client', 'Nb_Apparitions']
+            client_frequency = client_frequency[client_frequency['Nb_Apparitions'] > 1]
+            
+            if not client_frequency.empty:
+                st.dataframe(client_frequency, use_container_width=True)
+            else:
+                st.info("Aucun client n'apparaît dans plusieurs chaînes.")
+        else:
+            st.info("Aucune chaîne Cash In → Send Money → W2B détectée.")
+
     # 🔍 B2W → Send Money → W2B
     with st.spinner("Détection B2W → Send → W2B..."):
         b2w_send_w2b = []
