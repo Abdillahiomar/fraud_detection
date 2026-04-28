@@ -28,6 +28,7 @@ if uploaded_file:
         df['DEBIT_MSISDN'] = df['DEBIT_MSISDN'].str.strip()
         df['CREDIT_MSISDN'] = df['CREDIT_MSISDN'].str.strip()
         df['DATE'] = df['INITATE_DATE'].dt.date
+        df = df[df['TRANS_STATUS'].str.strip().str.upper() == 'COMPLETED'].reset_index(drop=True)
         
         # Créer des indexes pour accélérer les filtres
         df = df.sort_values('INITATE_DATE').reset_index(drop=True)
